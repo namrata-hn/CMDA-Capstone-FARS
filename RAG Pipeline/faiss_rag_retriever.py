@@ -1,3 +1,3 @@
-# felix
+# Felix
 
 import pandas as pd
