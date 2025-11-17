@@ -1,4 +1,5 @@
-# Felix
+#Felix
+
 
 """
 faiss_rag_retriever.py
@@ -8,15 +9,8 @@ RAG pipeline using:
 - DBRX (via Databricks model serving) as the LLM
 - A simple custom Retrieval-QA function (no langchain.chains dependency)
 
-Pipeline steps:
-1. Load dataset with pandas (CSV by default; adapt as needed)
-2. Convert rows to LangChain `Document`s
-3. Chunk text with RecursiveCharacterTextSplitter
-4. Embed chunks with DatabricksEmbeddings and store in FAISS
-5. Turn FAISS into a retriever
-6. Ask DBRX questions using retrieved context
-7. Optional interactive CLI-style chat
-
+Now supports loading data directly from a Databricks SQL table
+instead of a CSV.
 
 Make sure you have installed (in your Databricks cluster or notebook):
 
@@ -36,7 +30,7 @@ from databricks_langchain import DatabricksEmbeddings, ChatDatabricks
 
 
 # ------------------------------------------------------------------------
-# 1. Load dataset and convert to Documents
+# 1A. Load dataset from CSV (still available if you ever need it)
 # ------------------------------------------------------------------------
 
 def load_dataset_as_documents(
@@ -44,23 +38,6 @@ def load_dataset_as_documents(
     text_cols: Optional[List[str]] = None,
     id_col: Optional[str] = None,
 ) -> List[Document]:
-    """
-    Load a tabular dataset with pandas and convert each row into a LangChain Document.
-
-    Parameters
-    ----------
-    csv_path : str
-        Path to the CSV file. On Databricks this can be a DBFS path like '/dbfs/FileStore/...'.
-    text_cols : list of str, optional
-        Columns whose values will be concatenated into the main document text.
-        If None, all columns in the CSV will be used.
-    id_col : str, optional
-        Column to use as a unique identifier in metadata.
-
-    Returns
-    -------
-    docs : list[Document]
-    """
     df = pd.read_csv(csv_path)
 
     if text_cols is None:
@@ -68,7 +45,6 @@ def load_dataset_as_documents(
 
     docs: List[Document] = []
     for _, row in df.iterrows():
-        # Build a single text field from selected columns
         parts = [f"{col}: {row[col]}" for col in text_cols]
         text = "\n".join(parts)
 
@@ -76,9 +52,59 @@ def load_dataset_as_documents(
         if id_col and id_col in df.columns:
             metadata["id"] = row[id_col]
 
-        doc = Document(page_content=text, metadata=metadata)
-        docs.append(doc)
+        docs.append(Document(page_content=text, metadata=metadata))
+    return docs
 
+
+# ------------------------------------------------------------------------
+# 1B. Load dataset directly from a Databricks SQL table
+# ------------------------------------------------------------------------
+
+def load_table_as_documents(
+    table_name: str,
+    text_cols: Optional[List[str]] = None,
+    id_col: Optional[str] = None,
+) -> List[Document]:
+    """
+    Load a Databricks table with Spark and convert each row into a Document.
+
+    Parameters
+    ----------
+    table_name : str
+        Fully qualified table name, e.g. "workspace.fars_database.accident_master".
+    text_cols : list[str], optional
+        Columns to include in the text. If None, use all columns.
+    id_col : str, optional
+        Column to use as a unique identifier in metadata.
+
+    Returns
+    -------
+    docs : list[Document]
+    """
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+    sdf = spark.table(table_name)
+
+    if text_cols is not None:
+        sdf = sdf.select(*text_cols)
+
+    # Convert to pandas to reuse the same row → Document logic
+    df = sdf.toPandas()
+
+    if text_cols is None:
+        text_cols = list(df.columns)
+
+    docs: List[Document] = []
+    for _, row in df.iterrows():
+        parts = [f"{col}: {row[col]}" for col in text_cols]
+        text = "\n".join(parts)
+
+        metadata = {}
+        if id_col and id_col in df.columns:
+            metadata["id"] = row[id_col]
+
+        docs.append(Document(page_content=text, metadata=metadata))
     return docs
 
 
@@ -92,26 +118,6 @@ def build_faiss_vectorstore(
     chunk_overlap: int = 200,
     embedding_endpoint: str = "databricks-bge-large-en",
 ) -> FAISS:
-    """
-    Chunk documents, create embeddings with DatabricksEmbeddings, and store them in a FAISS index.
-
-    Parameters
-    ----------
-    docs : list[Document]
-        The original (possibly long) documents.
-    chunk_size : int
-        Max characters per chunk.
-    chunk_overlap : int
-        Overlap between chunks to preserve context.
-    embedding_endpoint : str
-        Name of the Databricks embedding endpoint (check Serving > Endpoints).
-
-    Returns
-    -------
-    vectorstore : FAISS
-        A FAISS vector store ready to be used as a retriever.
-    """
-    # 3. Chunk text
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -119,7 +125,6 @@ def build_faiss_vectorstore(
     )
     split_docs = splitter.split_documents(docs)
 
-    # 4. Embed & store in FAISS (Databricks embedding model)
     embeddings = DatabricksEmbeddings(endpoint=embedding_endpoint)
     vectorstore = FAISS.from_documents(split_docs, embeddings)
     return vectorstore
@@ -130,32 +135,14 @@ def build_faiss_vectorstore(
 # ------------------------------------------------------------------------
 
 class SimpleRAGQA:
-    """
-    A minimal Retrieval-QA helper that:
-      - uses a retriever (FAISS.as_retriever())
-      - calls DBRX with context + question
-    """
-
     def __init__(self, retriever, llm: ChatDatabricks):
         self.retriever = retriever
         self.llm = llm
 
     def answer(self, query: str) -> Tuple[str, List[Document]]:
-        """
-        Retrieve relevant docs and ask DBRX to answer using them.
-
-        Returns
-        -------
-        answer : str
-        source_docs : list[Document]
-        """
-        # Retrieve top-k similar chunks
         source_docs: List[Document] = self.retriever.get_relevant_documents(query)
-
-        # Build context string
         context = "\n\n".join(doc.page_content for doc in source_docs)
 
-        # Simple prompt template
         prompt = f"""
 You are a helpful assistant answering questions based on the provided context.
 
@@ -171,10 +158,8 @@ Question:
 Answer in clear, concise English:
 """
 
-        # Call DBRX via ChatDatabricks
         response = self.llm.invoke(prompt)
 
-        # response is usually a string (depending on the version of databricks_langchain)
         if hasattr(response, "content"):
             answer_text = response.content
         else:
@@ -189,26 +174,6 @@ def build_simple_rag_qa(
     temperature: float = 0.0,
     k: int = 4,
 ) -> SimpleRAGQA:
-    """
-    Create a SimpleRAGQA that uses:
-      - FAISS as retriever
-      - DBRX (via ChatDatabricks) as the chat model
-
-    Parameters
-    ----------
-    vectorstore : FAISS
-        Vector store created by build_faiss_vectorstore.
-    dbrx_endpoint : str
-        Name of the Databricks DBRX endpoint (Serving > Endpoints).
-    temperature : float
-        Sampling temperature (0 = deterministic).
-    k : int
-        Number of documents to retrieve per query.
-
-    Returns
-    -------
-    rag_qa : SimpleRAGQA
-    """
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": k},
@@ -223,17 +188,11 @@ def build_simple_rag_qa(
 
 
 # ------------------------------------------------------------------------
-# 7. Simple interactive interface (Notebook / terminal)
+# 7. Simple interactive interface
 # ------------------------------------------------------------------------
 
 def interactive_chat(rag_qa: SimpleRAGQA):
-    """
-    Simple REPL for chatting with the RAG system.
-
-    Type 'exit' or 'quit' to end the session.
-    """
-    print("RAG chat with DBRX ready. Ask questions about your data.")
-    print("Type 'exit' or 'quit' to end.\n")
+    print("RAG chat with DBRX ready. Type 'exit' or 'quit' to end.\n")
 
     while True:
         try:
@@ -253,7 +212,7 @@ def interactive_chat(rag_qa: SimpleRAGQA):
 
 
 # ------------------------------------------------------------------------
-# Main entry point (example usage)
+# Main entry point: now uses a SQL TABLE instead of CSV
 # ------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -263,35 +222,21 @@ if __name__ == "__main__":
     1. Ensure you have:
        - A Databricks model serving endpoint for DBRX (e.g. 'databricks-dbrx-instruct')
        - A Databricks embedding endpoint (e.g. 'databricks-bge-large-en')
-       - A CSV file in DBFS or local environment.
+       - A Databricks table with your data (e.g. workspace.fars_database.accident_master)
 
-    2. Update:
-       - CSV_PATH
-       - EMBEDDING_ENDPOINT
-       - DBRX_ENDPOINT
-
-    3. Run:
-       python faiss_rag_retriever.py
-       or run this in a Databricks notebook with %run.
     """
 
     # ---- CONFIG: change these for your environment ----
-    CSV_PATH = "data/example_dataset.csv"  # e.g. "/dbfs/FileStore/mydata/fars_joined.csv"
+    TABLE_NAME = "workspace.fars_database.accident_master"
     EMBEDDING_ENDPOINT = "databricks-bge-large-en"
     DBRX_ENDPOINT = "databricks-dbrx-instruct"
     # --------------------------------------------------
 
-    if not os.path.exists(CSV_PATH):
-        raise FileNotFoundError(
-            f"CSV file not found at {CSV_PATH}. "
-            "Update CSV_PATH in __main__ to point to your dataset."
-        )
-
-    # 1–2. Load and convert to Documents
-    documents = load_dataset_as_documents(
-        csv_path=CSV_PATH,
-        text_cols=None,   # or specify e.g. ["column1", "column2"]
-        id_col=None,      # or specify an ID column if you have one
+    # 1–2. Load and convert table rows to Documents
+    documents = load_table_as_documents(
+        table_name=TABLE_NAME,
+        text_cols=None,   # or e.g. ["ST_CASE", "STATE", "FATALS", "WEATHER"]
+        id_col=None,      # or an ID like "ST_CASE"
     )
 
     # 3–4. Build FAISS index
