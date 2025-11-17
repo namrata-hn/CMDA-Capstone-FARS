@@ -17,8 +17,6 @@ Pipeline steps:
 6. Ask DBRX questions using retrieved context
 7. Optional interactive CLI-style chat
 
-Run this file directly (python faiss_rag_retriever.py) or import and call
-the functions from a Databricks notebook.
 
 Make sure you have installed (in your Databricks cluster or notebook):
 
