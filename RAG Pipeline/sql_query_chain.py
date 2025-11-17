@@ -6,7 +6,7 @@ from databricks import sql
 import os
 
 from langchain_openai import ChatOpenAI
-from langchain.agents import create_sql_agent
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
 
 
 # ----------- Connect LangChain to Databricks Database ------------
