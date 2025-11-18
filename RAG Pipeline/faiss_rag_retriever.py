@@ -1,20 +1,24 @@
-#Felix
-
+# Felix
 
 """
 faiss_rag_retriever.py
 
 RAG pipeline using:
-- Databricks embeddings + FAISS as vector store
-- DBRX (via Databricks model serving) as the LLM
+- Ollama embeddings + FAISS as vector store
+- Ollama (local, free) as the LLM
 - A simple custom Retrieval-QA function (no langchain.chains dependency)
 
 Now supports loading data directly from a Databricks SQL table
 instead of a CSV.
 
-Make sure you have installed (in your Databricks cluster or notebook):
+Make sure you have installed (in your environment):
 
-%pip install -U langchain-core langchain-text-splitters langchain-community databricks-langchain faiss-cpu pandas
+%pip install -U langchain-core langchain-text-splitters langchain-community langchain-ollama faiss-cpu pandas
+
+Also ensure Ollama is running and you have pulled the models, e.g.:
+
+ollama pull llama3
+ollama pull nomic-embed-text
 """
 
 import os
@@ -26,7 +30,8 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 
-from databricks_langchain import DatabricksEmbeddings, ChatDatabricks
+# 🔁 Ollama integrations
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 
 
 # ------------------------------------------------------------------------
@@ -116,8 +121,26 @@ def build_faiss_vectorstore(
     docs: List[Document],
     chunk_size: int = 1000,
     chunk_overlap: int = 200,
-    embedding_endpoint: str = "databricks-bge-large-en",
+    embedding_model: str = "nomic-embed-text",
 ) -> FAISS:
+    """
+    Build a FAISS vector store using Ollama embeddings.
+
+    Parameters
+    ----------
+    docs : list[Document]
+        Documents to index.
+    chunk_size : int
+        Max characters per chunk.
+    chunk_overlap : int
+        Overlap between chunks.
+    embedding_model : str
+        Name of the Ollama embedding model (e.g. "nomic-embed-text").
+
+    Returns
+    -------
+    vectorstore : FAISS
+    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -125,7 +148,7 @@ def build_faiss_vectorstore(
     )
     split_docs = splitter.split_documents(docs)
 
-    embeddings = DatabricksEmbeddings(endpoint=embedding_endpoint)
+    embeddings = OllamaEmbeddings(model=embedding_model)
     vectorstore = FAISS.from_documents(split_docs, embeddings)
     return vectorstore
 
@@ -135,11 +158,14 @@ def build_faiss_vectorstore(
 # ------------------------------------------------------------------------
 
 class SimpleRAGQA:
-    def __init__(self, retriever, llm: ChatDatabricks):
+    def __init__(self, retriever, llm: ChatOllama):
         self.retriever = retriever
         self.llm = llm
 
     def answer(self, query: str) -> Tuple[str, List[Document]]:
+        """
+        Retrieve relevant docs and ask the LLM to answer using them.
+        """
         source_docs: List[Document] = self.retriever.get_relevant_documents(query)
         context = "\n\n".join(doc.page_content for doc in source_docs)
 
@@ -160,6 +186,7 @@ Answer in clear, concise English:
 
         response = self.llm.invoke(prompt)
 
+        # ChatOllama returns an AIMessage with `.content`
         if hasattr(response, "content"):
             answer_text = response.content
         else:
@@ -170,17 +197,33 @@ Answer in clear, concise English:
 
 def build_simple_rag_qa(
     vectorstore: FAISS,
-    dbrx_endpoint: str = "databricks-dbrx-instruct",
+    llm_model: str = "llama3",
     temperature: float = 0.0,
     k: int = 4,
 ) -> SimpleRAGQA:
+    """
+    Create a SimpleRAGQA that uses:
+      - FAISS as retriever
+      - Ollama Chat model (ChatOllama) as the LLM
+
+    Parameters
+    ----------
+    vectorstore : FAISS
+        Vector store created by build_faiss_vectorstore.
+    llm_model : str
+        Name of the Ollama chat model (e.g. "llama3", "mistral").
+    temperature : float
+        Sampling temperature.
+    k : int
+        Number of documents to retrieve per query.
+    """
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": k},
     )
 
-    llm = ChatDatabricks(
-        endpoint=dbrx_endpoint,
+    llm = ChatOllama(
+        model=llm_model,
         temperature=temperature,
     )
 
@@ -192,7 +235,7 @@ def build_simple_rag_qa(
 # ------------------------------------------------------------------------
 
 def interactive_chat(rag_qa: SimpleRAGQA):
-    print("RAG chat with DBRX ready. Type 'exit' or 'quit' to end.\n")
+    print("RAG chat with Ollama ready. Type 'exit' or 'quit' to end.\n")
 
     while True:
         try:
@@ -212,7 +255,7 @@ def interactive_chat(rag_qa: SimpleRAGQA):
 
 
 # ------------------------------------------------------------------------
-# Main entry point: now uses a SQL TABLE instead of CSV
+# Main entry point: still uses a SQL TABLE instead of CSV
 # ------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -220,16 +263,22 @@ if __name__ == "__main__":
     Example run:
 
     1. Ensure you have:
-       - A Databricks model serving endpoint for DBRX (e.g. 'databricks-dbrx-instruct')
-       - A Databricks embedding endpoint (e.g. 'databricks-bge-large-en')
-       - A Databricks table with your data (e.g. workspace.fars_database.accident_master)
+       - Ollama running locally
+       - An Ollama chat model pulled (e.g. 'llama3')
+       - An Ollama embedding model pulled (e.g. 'nomic-embed-text')
+       - A Databricks table with your data
+         (e.g. workspace.fars_database.accident_master)
 
+    2. Update:
+       - TABLE_NAME
+       - EMBEDDING_MODEL
+       - LLM_MODEL
     """
 
     # ---- CONFIG: change these for your environment ----
     TABLE_NAME = "workspace.fars_database.accident_master"
-    EMBEDDING_ENDPOINT = "databricks-bge-large-en"
-    DBRX_ENDPOINT = "databricks-dbrx-instruct"
+    EMBEDDING_MODEL = "nomic-embed-text"
+    LLM_MODEL = "llama3"
     # --------------------------------------------------
 
     # 1–2. Load and convert table rows to Documents
@@ -244,13 +293,13 @@ if __name__ == "__main__":
         docs=documents,
         chunk_size=1000,
         chunk_overlap=200,
-        embedding_endpoint=EMBEDDING_ENDPOINT,
+        embedding_model=EMBEDDING_MODEL,
     )
 
-    # 5–6. Build Simple RAG QA with DBRX
+    # 5–6. Build Simple RAG QA with Ollama
     rag_qa = build_simple_rag_qa(
         vectorstore=vectorstore,
-        dbrx_endpoint=DBRX_ENDPOINT,
+        llm_model=LLM_MODEL,
         temperature=0.0,
         k=4,
     )
