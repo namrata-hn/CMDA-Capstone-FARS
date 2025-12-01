@@ -1,0 +1,7 @@
+flask
+flask-cors
+langchain
+langchain-ollama
+pandas
+databricks-sql-connector
+faiss-cpu
