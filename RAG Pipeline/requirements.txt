@@ -3,5 +3,5 @@ langchain-community
 langchain
 langchain-ollama
 langchain-text-splitters
-databricks-sql-connector
-databricks-sqlalchemy
+# databricks-sql-connector
+# databricks-sqlalchemy
