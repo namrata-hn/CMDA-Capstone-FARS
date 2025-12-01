@@ -1,11 +1,14 @@
-import FARSChatbot from "./components/FARSChatbot";
+// src/App.jsx
+import React from "react"
+import FARSChatbot from "./components/FARSChatbot"
+import "./index.css"
 
 function App() {
   return (
-    <div>
+    <div className="app-root">
       <FARSChatbot />
     </div>
-  );
+  )
 }
 
-export default App;
+export default App
