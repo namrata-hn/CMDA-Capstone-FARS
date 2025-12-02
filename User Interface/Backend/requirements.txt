@@ -1,7 +1,10 @@
 flask
 flask-cors
-langchain
-langchain-ollama
+python-dotenv
 pandas
-databricks-sql-connector
+langchain
+langchain-community
+langchain-core
+langchain-ollama
 faiss-cpu
+databricks-sql-connector
