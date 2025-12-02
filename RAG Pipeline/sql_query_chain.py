@@ -1,31 +1,38 @@
 # Rafael
 
 from langchain_ollama import ChatOllama
-from langchain_community.utilities import SQLDatabase
 from dotenv import load_dotenv
 import os
-import ast
 import re 
-import decimal
-import pprint
+import pandas as pd
+from databricks import sql
+
+# ------------- Load environment variables --------------
 load_dotenv("../config/.env")
 
-# ---------------- Databricks Connection ----------------
-db = SQLDatabase.from_databricks(
-    catalog="workspace",
-    schema="fars_database",
-    api_token=os.getenv("DATABRICKS_TOKEN"),
-    host=os.getenv("DATABRICKS_HOST"),
-    warehouse_id=os.getenv("DATABRICKS_WAREHOUSE_ID"),
-    include_tables=["accident_master", "person_master", "vehicle_master"]
-)
+# --------- Databricks Connection and Execution ---------
+def run_databricks_query(query: str) -> pd.DataFrame:
+    """
+    Executes a SQL query on Databricks using the official connector.
+    Returns a pandas DataFrame with nullable dtypes.
+    """
+    with sql.connect(
+        server_hostname=os.getenv("DATABRICKS_HOST"),
+        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+        access_token=os.getenv("DATABRICKS_TOKEN")
+    ) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            arrow_table = cursor.fetchall_arrow()
+            df = arrow_table.to_pandas()
+            return df
 
 # ---------------- Ollama LLM ----------------
 llm = ChatOllama(model="llama3", temperature=0)
 
 # ---------------- Table & Schema Info ----------------
 TABLE_SCHEMAS = {
-    "accident_master": {
+    "workspace.fars_database.accident_master": {
         "columns": ["STATE", "ST_CASE", "PEDS", "PERNOTMVIT", "VE_TOTAL", "VE_FORMS", 
                     "PVH_INVL", "PERSONS", "PERMVIT", "COUNTY", "CITY", "MONTH", "DAY", 
                     "DAY_WEEK", "YEAR", "HOUR", "MINUTE", "TWAY_ID", "TWAY_ID2", "CL_TWAY", 
@@ -36,7 +43,7 @@ TABLE_SCHEMAS = {
                     "ARR_MIN", "HOSP_HR", "HOSP_MN", "FATALS"],
         "string_columns": ["RAIL", "TWAY_ID", "TWAY_ID2"]
     },
-    "person_master": {
+    "workspace.fars_database.person_master": {
         "columns": ["STATE", "ST_CASE", "PER_NO", "AGE", "SEX", "PER_TYP", "INJ_SEV", 
                    "SEAT_POS", "REST_USE", "REST_MIS", "HELM_USE", "HELM_MIS", "AIR_BAG", 
                    "EJECTION", "EJ_PATH", "EXTRICAT", "DRINKING", "ALC_STATUS", "ATST_TYP", 
@@ -46,7 +53,7 @@ TABLE_SCHEMAS = {
                    "WORK_INJ", "HISPANIC"],
         "string_columns": []
     },
-    "vehicle_master": {
+    "workspace.fars_database.vehicle_master": {
         "columns": ["STATE", "ST_CASE", "VEH_NO", "OCUPANTS", "NUMOCCS", "UNITTYPE", "HIT_RUN", 
                    "REG_STAT", "OWNER", "VIN", "MOD_YEAR", "VPICMAKE", "VPICMODEL", 
                    "VPICBODYCLASS", "MAKE", "MODEL", "BODY_TYP", "ICFINALBODY", "GVWR_FROM", 
@@ -77,8 +84,7 @@ def build_schema_prompt(tables):
         "Rules:\n"
         "1. ONLY use the tables and columns listed.\n"
         "2. NEVER guess or invent column names.\n"
-        "3. NEVER apply SQL functions to columns unless their type supports it "
-        "(e.g., do not apply YEAR() to numeric columns).\n"
+        "3. NEVER apply SQL functions to columns unless their type supports it.\n"
         "4. If a question requires columns from multiple tables, ALWAYS join them using ST_CASE.\n"
         "5. ST_CASE is the primary key that exists in all three tables and is ALWAYS the join key.\n"
         "6. Prefer SUM() when a question asks for totals of numeric fields.\n"
@@ -87,7 +93,7 @@ def build_schema_prompt(tables):
         "9. IMPERATIVE GROUP BY: Use GROUP BY for ANY column in the SELECT clause that is NOT aggregated (SUM, COUNT, etc.).\n"
         "10. IMPERATIVE JOIN: If columns from different tables are needed, join using `ON t1.ST_CASE = t2.ST_CASE`.\n"
         "11. Output ONLY the SQL query. No comments. No markdown.\n\n"
-        "12. NEVER reference tables that are not listed (e.g., accident_data is invalid).\n"
+        "12. NEVER reference tables that are not listed\n"
         "13. **NEVER use string literals like 'DRIVER' or 'RAIN' in WHERE clauses for these columns.** Use only numeric codes (e.g., `PER_TYP = 1`).\n"
         "Available Tables and Columns:\n"
     )
@@ -108,25 +114,7 @@ def build_schema_prompt(tables):
     
     return prompt
 
-# ---------------- Load metadata SQL file and append to prompt ----------------
-METADATA_SQL_PATH = "../metadata.sql"  # change if needed
-
-def load_metadata_sql(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return None
-
-METADATA_SQL_TEXT = load_metadata_sql(METADATA_SQL_PATH)
-if METADATA_SQL_TEXT:
-    # MAKE IT SMALL — we will append a brief excerpt to the prompt (not massive files)
-    METADATA_SQL_TEXT = METADATA_SQL_TEXT.strip()
-    if len(METADATA_SQL_TEXT) > 4000:
-        METADATA_SQL_TEXT = METADATA_SQL_TEXT[:4000] + "\n-- (truncated) --"
-
-
-# ---------------- Result Parsers ----------------
+# ---------------- Clean LLM SQL Output ----------------
 def clean_sql_output(sql_text):
     if sql_text is None:
         return ""
@@ -146,86 +134,42 @@ def clean_sql_output(sql_text):
         sql += ";"
     return sql
 
-# In sql_query_chain.py, replace the existing safe_fetch_single_value with this:
-def safe_fetch_single_value(result):
-    """Safely extract a single value (e.g., count or sum) from query result."""
-    
-    # 1. Handle direct None or empty string result
-    if result is None or (isinstance(result, str) and not result.strip()):
-        return 0
-    
-    # 2. Attempt to evaluate string results (common LangChain behavior)
-    if isinstance(result, str):
-        result = result.strip()
-        # Handle string representations of empty results
-        if result in ('[]', '[()]', 'None'):
-            return 0
-        try:
-            # Use ast.literal_eval to convert string representation of list/tuple/int/float
-            result = ast.literal_eval(result)
-        except Exception:
-            # If literal_eval fails, it might be a raw numeric string.
-            try:
-                return int(float(result)) # Attempt to cast to number
-            except:
-                return 0 # Fallback for unparseable raw string
+# ---------------------- Confirm Table Names ---------------------
+FULLY_QUALIFIED_TABLES = {
+    "accident_master": "workspace.fars_database.accident_master",
+    "person_master": "workspace.fars_database.person_master",
+    "vehicle_master": "workspace.fars_database.vehicle_master"
+}
 
-    # 3. Process list/tuple results (which should contain the final value)
-    if isinstance(result, (list, tuple)) and len(result) > 0:
-        first_row = result[0]
-        
-        # If the result is a list of rows (e.g., [(100,)]), extract the first value
-        if isinstance(first_row, (list, tuple)) and len(first_row) > 0:
-            val = first_row[0]
-            return val if val is not None else 0
-        
-        # If the result is a flat list/tuple (e.g., [100]), return the first element.
-        return first_row if first_row is not None else 0
-    
-    # 4. Handle direct numeric result
-    return result if result is not None else 0
+def qualify_table_names(sql_query: str) -> str:
+    for short_name, fq_name in FULLY_QUALIFIED_TABLES.items():
+        # only replace short_name if it is NOT already part of a fully-qualified name
+        pattern = rf"(?<!\.)\b{short_name}\b" 
+        sql_query = re.sub(pattern, fq_name, sql_query)
+    return sql_query
 
 # ---------------- Main Query Function ----------------
-# removed error feedback logic - implement back if needed.
 def ask_fars_database(question: str, max_retries: int = 0):
-    tables = ["accident_master", "person_master", "vehicle_master"]
+
+    tables = list(TABLE_SCHEMAS.keys())
     schema_prompt = build_schema_prompt(tables)
 
-    if METADATA_SQL_TEXT:
-        schema_prompt = schema_prompt + "\n\n-- METADATA SQL (reference):\n" + METADATA_SQL_TEXT + "\n\n"
+    # ------------------------ SQL GENERATION ------------------------
+    prompt = (
+        f"{schema_prompt}"
+        f"Question: {question}\n"
+        "Write ONLY the valid Databricks SQL query, starting with SELECT or WITH and ending with a semicolon."
+    )
+    response = llm.invoke(prompt)
+    sql_query = clean_sql_output(response.content.strip())
+    sql_query = qualify_table_names(sql_query)
 
-    # ------------------------
-    # SQL GENERATION (simple)
-    # ------------------------
-    def generate_sql(question):
-        prompt = (
-            f"{schema_prompt}"
-            f"Question: {question}\n"
-            "Write ONLY the valid Databricks SQL query, starting with SELECT or WITH and ending with a semicolon."
-        )
-        response = llm.invoke(prompt)
-        sql_text = clean_sql_output(response.content.strip())
-        return sql_text
-
-    # --- Generate SQL (no feedback loops)
-    sql_query = generate_sql(question)
     print("Generated SQL:", sql_query)
 
-    # ------------------------
-    # EXECUTE ONCE — NO RETRIES
-    # ------------------------
+    # ------------------------ SQL EXECUTION ------------------------
     try:
-        result = db.run(sql_query)
-
-        print("RAW DB RESULT:", result)
-        print("RAW TYPE:", type(result))
-
-        # If "show me ..." return table
-        if question.lower().startswith("show me"):
-            return result
-
-        return safe_fetch_single_value(result)
-
+        df = run_databricks_query(sql_query)
+        return df
     except Exception as e:
-        # Just return the error, no regeneration
-        return f"SQL execution error: {str(e)}"
+        print(f"SQL execution error: {e}")
+        return pd.DataFrame()
