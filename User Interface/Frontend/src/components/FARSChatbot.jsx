@@ -48,23 +48,35 @@ export default function FARSChatbot() {
 
       const data = await response.json();
 
-      let botText;
+      let botText = "";
 
-      if (data.rows.length === 1) {
-        botText = data.rows[0].join(" | ");
-      } else {
-        const header = data.columns.join(" | ");
-        const rows = data.rows.map(row => row.join(" | ")).join("\n");
-        botText = header + "\n" + rows;
+      // 1️⃣ If backend returns a natural-language answer, show it first.
+      if (data.answer && typeof data.answer === "string") {
+        botText += data.answer.trim() + "\n\n";
       }
+
+      // 2️⃣ Then show the table (columns/rows)
+      /* if (data.columns && data.rows) {
+        if (data.rows.length === 1) {
+          // single-row → inline result
+          botText += data.rows[0].join(" | ");
+        } else {
+          const header = data.columns.join(" | ");
+          const rows = data.rows.map(row => row.join(" | ")).join("\n");
+          botText += header + "\n" + rows;
+        }
+      } else {
+        botText += "No data returned.";
+      }*/
 
       const botMessage = {
         id: Date.now() + 1,
         type: "bot",
-        text: botText
+        text: botText.trim()
       };
 
       setMessages(prev => [...prev, botMessage]);
+
     } catch (err) {
       setMessages(prev => [
         ...prev,
@@ -79,6 +91,7 @@ export default function FARSChatbot() {
     setIsThinking(false);
     setIsDisabled(false);
   };
+
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey && !isDisabled) {

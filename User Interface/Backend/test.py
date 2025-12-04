@@ -1,10 +1,9 @@
 # test_sql_query_chain.py
-# Test Ollama SQL generation and Databricks execution separately
+# Test Ollama SQL generation, Databricks execution, and NL answer creation
 
 from sql_query_chain import ask_fars_database
 import pandas as pd
 
-# ---------------- Example Usage with Ollama SQL generation ----------------
 questions = [
     "How many total fatalities were there in 2023?",
     "Show me the weather (WEATHER) and number of fatalities (FATALS) for accidents in Virginia (STATE=51) in 2022",
@@ -12,15 +11,39 @@ questions = [
 ]
 
 for i, q in enumerate(questions, start=1):
-    print(f"\nQ{i}: {q}")
-    # Generate SQL via Ollama and run on Databricks
-    df = ask_fars_database(q)
+    print(f"\n====================")
+    print(f"Question {i}: {q}")
+    print(f"====================")
 
+    # ask the full SQL → Databricks → NL answer pipeline
+    response = ask_fars_database(q)
+
+    # expected structure:
+    # {
+    #     "query": "...",
+    #     "results": <DataFrame>,
+    #     "answer": "..."
+    # }
+
+    # Safety check
+    if not isinstance(response, dict):
+        print("❌ Unexpected return type from ask_fars_database()")
+        print(response)
+        continue
+
+    # --- Show generated SQL ---
+    print("\n📌 Generated SQL:")
+    print(response.get("query", "[No SQL produced]"))
+
+    # --- Show DataFrame results ---
+    df = response.get("results")
+
+    print("\n📊 Query Results:")
     if isinstance(df, pd.DataFrame) and not df.empty:
-        # If query returns multiple rows/columns, print as DataFrame
-        print(f"A{i}:\n{df}\n")
-        # Optionally, for single-value queries like COUNT or SUM, extract scalar
-        if df.shape[0] == 1 and df.shape[1] == 1:
-            print(f"Scalar value: {df.iloc[0,0]}")
+        print(df)
     else:
-        print(f"A{i}: No results returned")
+        print("[No rows returned]")
+
+    # --- Show sentence-style answer ---
+    print("\n📝 Natural Language Answer:")
+    print(response.get("answer", "[No NL answer generated]"))

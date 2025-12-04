@@ -1,14 +1,11 @@
-from langchain_ollama import ChatOllama
+# Rafael
+
+from langchain_anthropic import ChatAnthropic
 from dotenv import load_dotenv
 import os
 import re 
 import pandas as pd
 from databricks import sql
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ------------- Load environment variables --------------
 load_dotenv("../../config/.env")
@@ -19,36 +16,19 @@ def run_databricks_query(query: str) -> pd.DataFrame:
     Executes a SQL query on Databricks using the official connector.
     Returns a pandas DataFrame with nullable dtypes.
     """
-    try:
-        with sql.connect(
-            server_hostname=os.getenv("DATABRICKS_HOST"),
-            http_path=os.getenv("DATABRICKS_HTTP_PATH"),
-            access_token=os.getenv("DATABRICKS_TOKEN")
-        ) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(query)
-                arrow_table = cursor.fetchall_arrow()
-                df = arrow_table.to_pandas()
-                logger.info(f"Query executed successfully, returned {len(df)} rows")
-                return df
-    except Exception as e:
-        logger.error(f"Databricks query execution error: {str(e)}")
-        raise
+    with sql.connect(
+        server_hostname=os.getenv("DATABRICKS_HOST"),
+        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+        access_token=os.getenv("DATABRICKS_TOKEN")
+    ) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            arrow_table = cursor.fetchall_arrow()
+            df = arrow_table.to_pandas()
+            return df
 
-# ---------------- Ollama LLM ----------------
+# ---------------- Claude LLM ----------------
 llm = None
-
-def get_llm():
-    """Lazy initialization of LLM"""
-    global llm
-    if llm is None:
-        try:
-            llm = ChatOllama(model="llama3", temperature=0)
-            logger.info("LLM initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM: {str(e)}")
-            raise
-    return llm
 
 # ---------------- Table & Schema Info ----------------
 TABLE_SCHEMAS = {
@@ -112,7 +92,7 @@ def build_schema_prompt(tables):
         "8. Use COALESCE in SUM for numeric columns: `SUM(COALESCE(column, 0))`.\n"
         "9. IMPERATIVE GROUP BY: Use GROUP BY for ANY column in the SELECT clause that is NOT aggregated (SUM, COUNT, etc.).\n"
         "10. IMPERATIVE JOIN: If columns from different tables are needed, join using `ON t1.ST_CASE = t2.ST_CASE`.\n"
-        "11. Output ONLY the SQL query. No comments. No markdown.\n"
+        "11. Output ONLY the SQL query. No comments. No markdown.\n\n"
         "12. NEVER reference tables that are not listed\n"
         "13. **NEVER use string literals like 'DRIVER' or 'RAIN' in WHERE clauses for these columns.** Use only numeric codes (e.g., `PER_TYP = 1`).\n"
         "Available Tables and Columns:\n"
@@ -168,96 +148,35 @@ def qualify_table_names(sql_query: str) -> str:
         sql_query = re.sub(pattern, fq_name, sql_query)
     return sql_query
 
-# ---------------- LLM Explanation --------------------
-def llm_explanation(question: str, df: pd.DataFrame) -> str:
-    """
-    Uses Ollama to convert the Databricks query result into a natural language answer.
-    """
-    try:
-        llm = get_llm()
-        
-        # Handle empty results
-        if df.empty:
-            return "The query returned no results. This might mean there's no data matching your criteria."
-        
-        # convert dataframe to JSON (safer + shorter)
-        result_json = df.to_dict(orient="records")
-
-        prompt = (
-            "You are an expert data interpreter.\n"
-            "The user asked the following question:\n"
-            f"QUESTION: {question}\n\n"
-            "Here is the SQL result from Databricks:\n"
-            f"{result_json}\n\n"
-            "Write a short, clean English answer explaining the result. Do NOT mention SQL, tables, or databases."
-        )
-
-        response = llm.invoke(prompt)
-        return response.content.strip()
-    except Exception as e:
-        logger.error(f"Error generating explanation: {str(e)}")
-        return f"Query executed successfully but explanation generation failed: {str(e)}"
-
 # ---------------- Main Query Function ----------------
 def ask_fars_database(question: str, max_retries: int = 0):
-    """
-    Main function to process natural language questions and return SQL results.
-    Returns a dict with 'query', 'results', and 'answer' keys.
-    """
-    try:
-        llm = get_llm()
-        
-        tables = list(TABLE_SCHEMAS.keys())
-        schema_prompt = build_schema_prompt(tables)
-
-        # ------------------------ SQL GENERATION ------------------------
-        prompt = (
-            f"{schema_prompt}"
-            f"Question: {question}\n"
-            "Write ONLY the valid Databricks SQL query, starting with SELECT or WITH and ending with a semicolon."
+    global llm
+    if llm is None:
+        llm = ChatAnthropic(
+            model="claude-haiku-4-5-20251001",  # or haiku-4-5
+            temperature=0,
+            max_tokens=1024
         )
-        
-        logger.info(f"Generating SQL for question: {question}")
-        response = llm.invoke(prompt)
-        sql_query = clean_sql_output(response.content.strip())
-        sql_query = qualify_table_names(sql_query)
-        
-        logger.info(f"Generated SQL: {sql_query}")
 
-        # Check if SQL was actually generated
-        if not sql_query or sql_query == ";":
-            error_msg = "Failed to generate valid SQL query from the question."
-            logger.error(error_msg)
-            return {
-                "query": None,
-                "results": pd.DataFrame(),
-                "answer": error_msg
-            }
+    tables = list(TABLE_SCHEMAS.keys())
+    schema_prompt = build_schema_prompt(tables)
 
-        # ------------------------ SQL EXECUTION ------------------------
-        try:
-            df = run_databricks_query(sql_query)
-            nl_answer = llm_explanation(question, df)
+    # ------------------------ SQL GENERATION ------------------------
+    prompt = (
+        f"{schema_prompt}"
+        f"Question: {question}\n"
+        "Write ONLY the valid Databricks SQL query, starting with SELECT or WITH and ending with a semicolon."
+    )
+    response = llm.invoke(prompt)
+    sql_query = clean_sql_output(response.content.strip())
+    sql_query = qualify_table_names(sql_query)
 
-            return {
-                "query": sql_query,
-                "results": df,
-                "answer": nl_answer
-            }
-        except Exception as e:
-            error_msg = f"SQL execution error: {str(e)}"
-            logger.error(error_msg)
-            return {
-                "query": sql_query,
-                "results": pd.DataFrame(),
-                "answer": error_msg
-            }
-            
+    print("Generated SQL:", sql_query)
+
+    # ------------------------ SQL EXECUTION ------------------------
+    try:
+        df = run_databricks_query(sql_query)
+        return df
     except Exception as e:
-        error_msg = f"Error in ask_fars_database: {str(e)}"
-        logger.exception(error_msg)
-        return {
-            "query": None,
-            "results": pd.DataFrame(),
-            "answer": error_msg
-        }
+        print(f"SQL execution error: {e}")
+        return pd.DataFrame()
