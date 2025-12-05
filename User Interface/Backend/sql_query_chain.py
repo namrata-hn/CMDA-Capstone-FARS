@@ -6,6 +6,7 @@ import pandas as pd
 from databricks import sql
 import logging
 from metadata_loader import load_fars_codebook
+from metadata_extractor import extract_relevant_metadata
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -101,39 +102,72 @@ TABLE_SCHEMAS = {
 }
 
 # ---------------- Schema Prompt Builder ----------------
-def build_schema_prompt(tables):
+def build_schema_prompt(tables, question: str = ""):
+    """Build schema prompt with optional metadata context based on question keywords."""
+    
     prompt = (
-        "You are an expert SQL generator for a Databricks SQL database.\n"
-        "You MUST follow all the rules below:\n\n"
-        "Rules:\n"
-        "1. ONLY use the tables and columns listed.\n"
+        "You are an expert SQL generator for a Databricks SQL database.\n\n"
+        "=== YOUR TASK ===\n"
+        "Analyze the user's question, identify which columns are relevant based on the metadata provided,\n"
+        "then generate the appropriate SQL query using those columns and their numeric codes.\n\n"
+        
+        "=== CRITICAL RULES ===\n"
+        "1. ONLY use the tables and columns listed in the schema below.\n"
         "2. NEVER guess or invent column names.\n"
-        "3. NEVER apply SQL functions to columns unless their type supports it.\n"
-        "4. If a question requires columns from multiple tables, ALWAYS join them using ST_CASE.\n"
-        "5. ST_CASE is the primary key that exists in all three tables and is ALWAYS the join key.\n"
-        "6. Prefer SUM() when a question asks for totals of numeric fields.\n"
-        "7. Numeric columns must never be quoted.\n"
-        "8. Use COALESCE in SUM for numeric columns: `SUM(COALESCE(column, 0))`.\n"
-        "9. IMPERATIVE GROUP BY: When using ANY aggregate function (SUM, COUNT, AVG, etc.), you MUST include a GROUP BY clause with ALL non-aggregated columns from the SELECT clause.\n"
-        "10. IMPERATIVE JOIN: If columns from different tables are needed, join using `ON t1.ST_CASE = t2.ST_CASE`.\n"
-        "11. Output ONLY the SQL query. No comments. No markdown.\n"
-        "12. NEVER reference tables that are not listed\n"
-        "13. **NEVER use string literals like 'DRIVER' or 'RAIN' in WHERE clauses for these columns.** Use only numeric codes (e.g., `PER_TYP = 1`).\n"
-        "Available Tables and Columns:\n"
+        "3. When metadata shows code mappings, you MUST use the NUMERIC codes (e.g., SCH_BUS = 1, not 'SCHOOL_BUS').\n"
+        "4. ST_CASE is the join key between all three tables.\n"
+        "5. For aggregations (COUNT, SUM, AVG), include GROUP BY with all non-aggregated SELECT columns.\n"
+        "6. Use COALESCE for nullable numeric columns in aggregations: SUM(COALESCE(column, 0)).\n"
+        "7. Output ONLY the SQL query - no explanations, no markdown, no comments.\n\n"
     )
+    
+    # Add keyword-based metadata context using the new metadata_extractor module
+    if question and COLUMN_METADATA:
+        metadata_context = extract_relevant_metadata(
+            question=question,
+            column_metadata=COLUMN_METADATA,
+            max_codes_per_column=20
+        )
+        if metadata_context:
+            prompt += metadata_context
+            prompt += (
+                "\n=== HOW TO USE THE METADATA ABOVE ===\n"
+                "1. Read the column descriptions to understand what each column represents\n"
+                "2. Look at the code mappings to find the NUMERIC value that matches the user's question\n"
+                "3. Use those numeric values in your WHERE clauses\n"
+                "4. Example: If user asks about 'school bus', use SCH_BUS = 1 (where 1 = 'Yes')\n\n"
+                "5. IMPORTANT: Only JOIN tables if you need columns from DIFFERENT tables\n\n"
+            )
+    
+    prompt += "\n=== AVAILABLE TABLES AND COLUMNS ===\n"
     
     for t in tables:
         table_info = TABLE_SCHEMAS[t]
-        prompt += f"- **{t}** (Join Key: ST_CASE):\n"
-        prompt += f"  All Columns: {', '.join(table_info['columns'])}\n"
+        prompt += f"\n📋 {t}\n"
+        prompt += f"   Join Key: ST_CASE\n"
+        prompt += f"   Columns: {', '.join(table_info['columns'])}\n"
+        
         numeric_cols = [c for c in table_info['columns'] if c not in table_info.get('string_columns', [])]
         if numeric_cols:
-            prompt += f"  Numeric Columns (Use for math/comparison): {', '.join(numeric_cols)}\n"
+            prompt += f"   Numeric (use for math/filtering): {', '.join(numeric_cols)}\n"
         if table_info.get("string_columns"):
-            prompt += f"  String Columns (May need quotes): {', '.join(table_info['string_columns'])}\n"
+            prompt += f"   String (may need quotes): {', '.join(table_info['string_columns'])}\n"
     
     prompt += (
-        "\nFinal Instruction: Write ONLY the valid Databricks SQL query, starting with SELECT or WITH, and ending with a semicolon, with NO markdown formatting.\n"
+        "\n=== SQL GENERATION PROCESS ===\n"
+        "1. Identify which columns from the metadata above match the user's question\n"
+        "2. Determine which table(s) contain those columns\n"
+        "3. Find the appropriate numeric codes from the metadata for any filtered values\n"
+        "4. Construct the SQL query using:\n"
+        "   - SELECT: columns to return\n"
+        "   - FROM: primary table\n"
+        "   - JOIN: if columns from multiple tables (use ST_CASE)\n"
+        "   - WHERE: filter conditions using numeric codes\n"
+        "   - GROUP BY: if using aggregations\n"
+        "   - LIMIT: if asking for 'example' or small sample\n"
+        "5. Output ONLY the SQL query with a semicolon at the end\n\n"
+        
+        "FINAL REMINDER: Use NUMERIC CODES from metadata, never string literals!\n"
     )
     
     return prompt
@@ -328,7 +362,7 @@ def llm_explanation(question: str, df: pd.DataFrame, sql_query: str = "") -> str
             "- Examples:\n"
             "  * \"According to the FARS data, there were 40,901 total fatalities in 2023.\"\n"
             "  * \"According to the FARS data, there were 2,829,432 accidents involving 17-year-old drivers.\"\n\n"
-            
+
             "FOR MULTI-ROW RESULTS:\n"
             "1. Start with ONLY: \"According to the FARS data, accidents in Virginia (STATE=51) in 2022 had fatalities in various weather conditions.\"\n\n"
             
@@ -380,17 +414,32 @@ def ask_fars_database(question: str, max_retries: int = 0):
         llm = get_llm()
         
         tables = list(TABLE_SCHEMAS.keys())
-        schema_prompt = build_schema_prompt(tables)
+        
+        # Build the enhanced prompt with metadata context
+        schema_prompt = build_schema_prompt(tables, question)
 
         # ------------------------ SQL GENERATION ------------------------
-        prompt = (
+        full_prompt = (
             f"{schema_prompt}"
-            f"Question: {question}\n"
-            "Write ONLY the valid Databricks SQL query, starting with SELECT or WITH and ending with a semicolon."
+            f"\n=== USER QUESTION ===\n{question}\n\n"
+            f"=== QUERY REQUIREMENTS ===\n"
+        )
+        
+        # Add specific guidance based on question type
+        if any(word in question.lower() for word in ['example', 'sample', 'show me an', 'give me an']):
+            full_prompt += "- User wants an EXAMPLE, so use LIMIT 1 or LIMIT 5\n"
+        if any(word in question.lower() for word in ['how many', 'count', 'total', 'number of']):
+            full_prompt += "- User wants a COUNT or aggregate, so use COUNT() or SUM()\n"
+        if any(word in question.lower() for word in ['distribution', 'breakdown', 'by']):
+            full_prompt += "- User wants grouped results, so use GROUP BY\n"
+        
+        full_prompt += (
+            f"\n=== YOUR SQL QUERY ===\n"
+            "Now generate the SQL query following all the rules above:\n"
         )
         
         logger.info(f"Generating SQL for question: {question}")
-        response = llm.invoke(prompt)
+        response = llm.invoke(full_prompt)
         sql_query = clean_sql_output(response.content.strip())
         sql_query = qualify_table_names(sql_query)
         
