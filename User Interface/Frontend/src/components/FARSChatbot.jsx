@@ -44,30 +44,53 @@ export default function FARSChatbot() {
         body: JSON.stringify({ query: userMessage.text })
       });
 
-      if (!response.ok) throw new Error("Backend error");
+      // NOTE: This block handles HTTP errors (4xx, 5xx), which often include SQL errors 
+      // where the server responded but with an error status.
+      if (!response.ok) {
+        // Attempt to read the error message from the response body if available,
+        // otherwise default to a generic error message.
+        let errorDetail = "Server responded with an error status.";
+        try {
+          const errorJson = await response.json();
+          // Assuming the backend sends an 'error' field on failure
+          if (errorJson.error) {
+            errorDetail = errorJson.error;
+          } else if (response.statusText) {
+            errorDetail = `HTTP ${response.status}: ${response.statusText}`;
+          }
+        } catch (e) {
+          // If response body isn't JSON, use status text
+          if (response.statusText) {
+            errorDetail = `HTTP ${response.status}: ${response.statusText}`;
+          }
+        }
+        
+        // This is the message for a query/SQL execution failure
+        setMessages(prev => [
+          ...prev,
+          {
+            id: Date.now() + 1,
+            type: "bot",
+            text: `⚠️ **Query Failed:** There was an issue processing your request. ${errorDetail}`
+          }
+        ]);
+        
+        // Skip the rest of the 'try' block on error
+        setIsThinking(false);
+        setIsDisabled(false);
+        return; 
+      }
+      // END of !response.ok handling
+      
 
       const data = await response.json();
 
       let botText = "";
 
-      // 1️⃣ If backend returns a natural-language answer, show it first.
+      // If backend returns a natural-language answer, show it first.
       if (data.answer && typeof data.answer === "string") {
         botText += data.answer.trim() + "\n\n";
       }
-
-      // 2️⃣ Then show the table (columns/rows)
-      /* if (data.columns && data.rows) {
-        if (data.rows.length === 1) {
-          // single-row → inline result
-          botText += data.rows[0].join(" | ");
-        } else {
-          const header = data.columns.join(" | ");
-          const rows = data.rows.map(row => row.join(" | ")).join("\n");
-          botText += header + "\n" + rows;
-        }
-      } else {
-        botText += "No data returned.";
-      }*/
 
       const botMessage = {
         id: Date.now() + 1,
@@ -78,12 +101,15 @@ export default function FARSChatbot() {
       setMessages(prev => [...prev, botMessage]);
 
     } catch (err) {
+      // NOTE: This catch block now primarily handles network errors (e.g., server offline, CORS issues) 
+      // or issues parsing the final JSON response, but it no longer catches the 'Backend error' 
+      // thrown by the '!response.ok' check above.
       setMessages(prev => [
         ...prev,
         {
           id: Date.now() + 1,
           type: "bot",
-          text: "❌ Could not reach the backend: " + err.message
+          text: `❌ **Connection Error:** Could not connect to the backend server (http://127.0.0.1:5000). Please check the server status. Detail: ${err.message}`
         }
       ]);
     }
@@ -91,7 +117,6 @@ export default function FARSChatbot() {
     setIsThinking(false);
     setIsDisabled(false);
   };
-
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey && !isDisabled) {

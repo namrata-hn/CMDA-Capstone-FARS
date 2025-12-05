@@ -3,7 +3,7 @@ from flask.json import jsonify
 from flask_cors import CORS
 import logging
 import pandas as pd
-from sql_query_chain import ask_fars_database
+from orchestration import answer_question
 
 def create_app():
     app = Flask(__name__)
@@ -23,70 +23,49 @@ def create_app():
     @app.route("/query", methods=["POST"])
     def query():
         try:
-            # Parse request
             payload = request.get_json(force=True)
             question = payload.get("query") or payload.get("question")
 
             if not question:
-                logger.error("Missing query field in request")
                 return jsonify({"error": "Missing 'query' field"}), 400
 
             logger.info(f"Received question: {question}")
 
-            # Run the FARS database query
-            result = ask_fars_database(question)
-            
-            # Log the result structure for debugging
-            logger.info(f"Result keys: {result.keys()}")
+            # NEW: run hybrid SQL+RAG orchestration
+            result = answer_question(question)
 
-            # Extract pieces with safer defaults
-            sql_query = result.get("query", "")
-            df = result.get("results", pd.DataFrame())
-            nl_answer = result.get("answer", "")
+            # Handle different output shapes
+            # If SQL-only or BOTH, `ask_fars_database()` returns a dict
+            if isinstance(result, dict):
+                sql_query = result.get("query", "")
+                df = result.get("results", pd.DataFrame())
+                nl_answer = result.get("answer", "")
 
-            # Check if query generation failed
-            if sql_query is None or sql_query == "":
-                logger.error(f"SQL generation failed: {nl_answer}")
-                return jsonify({
-                    "error": "Failed to generate SQL query",
-                    "details": nl_answer
-                }), 500
-
-            # Check if DataFrame is valid
-            if not isinstance(df, pd.DataFrame):
-                logger.error(f"Invalid DataFrame returned: {type(df)}")
-                return jsonify({
-                    "error": "Query execution returned invalid data format"
-                }), 500
-
-            # Check if query execution had an error
-            if "error" in nl_answer.lower() or "exception" in nl_answer.lower():
-                logger.error(f"Query execution error: {nl_answer}")
-                return jsonify({
-                    "error": "Query execution failed",
-                    "details": nl_answer,
-                    "query": sql_query
-                }), 500
-
-            # Convert DataFrame to JSON-serializable format
-            try:
+                # Convert dataframe to JSON
                 json_output = {
                     "query": sql_query,
                     "columns": list(df.columns),
                     "rows": df.fillna("").astype(str).values.tolist(),
                     "answer": nl_answer,
-                    "row_count": len(df)
+                    "row_count": len(df),
                 }
-                
-                logger.info(f"Successfully processed query. Returned {len(df)} rows")
                 return jsonify(json_output), 200
-                
-            except Exception as e:
-                logger.exception("Error converting DataFrame to JSON")
+
+            # If RAG-only or a text explanation, it's a plain string
+            if isinstance(result, str):
                 return jsonify({
-                    "error": "Failed to format results",
-                    "details": str(e)
-                }), 500
+                    "query": None,
+                    "columns": [],
+                    "rows": [],
+                    "answer": result,
+                    "row_count": 0
+                }), 200
+
+            # Fallback
+            return jsonify({
+                "error": "Unexpected result type",
+                "details": str(type(result))
+            }), 500
 
         except Exception as e:
             logger.exception("Unexpected server error")

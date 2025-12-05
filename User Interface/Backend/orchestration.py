@@ -25,7 +25,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 # 2) LOAD PREBUILT FAISS INDEX (accident table only)
 # ----------------------------------------------
 
-FAISS_PATH = "../accident_master_faiss"   # <-- update to match your folder
+FAISS_PATH = "../../accident_master_faiss"
 
 print(f"Loading FAISS vectorstore from: {FAISS_PATH}")
 
