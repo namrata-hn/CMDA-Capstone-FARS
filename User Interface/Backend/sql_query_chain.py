@@ -5,6 +5,7 @@ import re
 import pandas as pd
 from databricks import sql
 import logging
+from metadata_loader import load_fars_codebook
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -13,124 +14,8 @@ logger = logging.getLogger(__name__)
 # ------------- Load environment variables --------------
 load_dotenv("../../config/.env")
 
-# ---------------- Column Metadata ----------------
-def load_column_metadata_from_sql(sql_file_path: str = "../../metadata.sql"):
-    """
-    Parse SQL file and extract column metadata, including code-value mappings,
-    from comments.
-    """
-    metadata = {
-        "accident_master": {},
-        "person_master": {},
-        "vehicle_master": {}
-    }
-    
-    try:
-        if not os.path.exists(sql_file_path):
-            logger.warning(f"Metadata file not found at: {sql_file_path}")
-            return metadata
-            
-        with open(sql_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        current_table = None
-        current_col = None
-        
-        # Split content into individual lines
-        lines = content.split('\n')
-        
-        # Regex for column definition: `COLUMN_NAME` type -- Description text
-        col_def_pattern = re.compile(r'^\s*`([^`]+)`\s+.*--\s*(.+)$')
-        
-        # Regex for code mapping: -- \s* (\d+ | 'string') \s* = \s* 'Description'
-        # We assume the metadata file lists codes on subsequent lines after the column definition.
-        code_map_pattern = re.compile(r'^\s*--\s*(\d+|\'[^\']+\')\s*=\s*([^\n]+)$', re.IGNORECASE)
-        
-        for line in lines:
-            line = line.strip()
-
-            # 1. Detect which table we're in
-            if 'CREATE TABLE `accident_master`' in line:
-                current_table = "accident_master"
-                current_col = None
-                continue
-            elif 'CREATE TABLE `vehicle_master`' in line:
-                current_table = "vehicle_master"
-                current_col = None
-                continue
-            elif 'CREATE TABLE `person_master`' in line:
-                current_table = "person_master"
-                current_col = None
-                continue
-            elif not current_table:
-                # Skip if we are outside a table definition
-                continue
-
-            # 2. Parse column definitions with primary comments
-            col_match = col_def_pattern.match(line)
-            if col_match:
-                col_name = col_match.group(1).upper()
-                description = col_match.group(2).strip()
-                
-                # Store the column with a description and an empty codes dict
-                metadata[current_table][col_name] = {
-                    "description": description,
-                    "codes": {}
-                }
-                current_col = col_name
-
-                # ---------------- Inline code mapping extraction ----------------
-                # e.g., "Atmospheric conditions (1 = Clear, 2 = Rain, 3 = Sleet/Hail, ..., 98 = Not reported)"
-                inline_code_pattern = re.compile(r'(\d+)\s*=\s*([^,)\n]+)')
-                matches = inline_code_pattern.findall(description)
-                for code, label in matches:
-                    try:
-                        code_key = int(code)
-                    except ValueError:
-                        code_key = code.strip()
-                    metadata[current_table][col_name]["codes"][code_key] = label.strip()
-
-                continue
-            
-            # 3. Parse code mappings for the currently defined column
-            code_map_match = code_map_pattern.match(line)
-            if current_col and code_map_match:
-                # Key is the code (e.g., '1', or 'Yes'), Value is the label (e.g., 'Clear')
-                code_key = code_map_match.group(1).strip().strip("'") # Remove quotes if present
-                code_label = code_map_match.group(2).strip()
-                
-                # Attempt to convert code_key to int for consistency with query results
-                try:
-                    code_key = int(code_key)
-                except ValueError:
-                    # Keep as string if it's not a simple integer
-                    pass
-                
-                # Store the mapping
-                metadata[current_table][current_col]["codes"][code_key] = code_label
-                continue
-            
-            # If line is blank or just a comment, reset current_col context 
-            # to prevent unrelated comments from being attached.
-            if not line:
-                current_col = None
-        
-        # Clean up the metadata: remove the 'codes' key if it's empty
-        for table in metadata:
-            for col in list(metadata[table].keys()):
-                if isinstance(metadata[table][col], dict) and not metadata[table][col]["codes"]:
-                    # If no codes found, just store the description string directly
-                    metadata[table][col] = metadata[table][col]["description"]
-
-        logger.info("Column metadata successfully loaded and parsed.")
-        return metadata
-        
-    except Exception as e:
-        logger.error(f"Error loading column metadata: {str(e)}")
-        # If parsing fails, return what was gathered or an empty set
-        return metadata
-
-COLUMN_METADATA = load_column_metadata_from_sql()
+# ---------------- Column Metadata ---------------- 
+COLUMN_METADATA = load_fars_codebook("../../fars_codebook.csv")
 
 # --------- Databricks Connection and Execution ---------
 def run_databricks_query(query: str) -> pd.DataFrame:
@@ -289,75 +174,89 @@ def qualify_table_names(sql_query: str) -> str:
 
 def get_column_metadata_context(df: pd.DataFrame, sql_query: str) -> str:
     """
-    Extract metadata for columns that appear in the query results, 
-    including code-to-label mappings.
-    Ensures numeric codes are correctly mapped for the LLM.
+    Build natural-language context for columns in the query result using
+    the metadata loaded from fars_codebook.csv.
+
+    Uses COLUMN_METADATA structure:
+        COLUMN_METADATA[table][column] = {
+            "description": str,
+            "codes": { "1": "Clear", "2": "Rain", ... }
+        }
     """
     if not COLUMN_METADATA:
         return ""
-    
-    context_lines = []
-    columns_in_result = list(df.columns)
-    
-    # Determine which tables are used in the query
+
+    columns_in_result = [c.upper() for c in df.columns]
     query_lower = sql_query.lower()
+
+    # Determine which tables appear in the query
     tables_used = []
-    if 'accident_master' in query_lower:
-        tables_used.append('accident_master')
-    if 'vehicle_master' in query_lower:
-        tables_used.append('vehicle_master')
-    if 'person_master' in query_lower:
-        tables_used.append('person_master')
-    
-    # Fallback: search all tables if none detected
+    if "accident_master" in query_lower:
+        tables_used.append("accident")
+    if "vehicle_master" in query_lower:
+        tables_used.append("vehicle")
+    if "person_master" in query_lower:
+        tables_used.append("person")
+
+    # Fallback: search all tables
     if not tables_used:
-        tables_used = ['accident_master', 'vehicle_master', 'person_master']
+        tables_used = list(COLUMN_METADATA.keys())
 
-    # Loop through result columns
+    context_lines = []
+    context_lines.append("Column Meanings:")
+
     for col in columns_in_result:
-        col_upper = col.upper()
         found = False
-        
-        # Check all relevant tables
-        for table_name in tables_used + list(set(COLUMN_METADATA.keys()) - set(tables_used)):
-            table_metadata = COLUMN_METADATA.get(table_name, {})
-            metadata_entry = table_metadata.get(col_upper)
-            
-            if metadata_entry:
-                # If it's a dict, it contains description and code map
-                if isinstance(metadata_entry, dict):
-                    description = metadata_entry.get('description', f"Codes for {col}")
-                    context_lines.append(f"- {col}: {description}")
-                    
-                    # Format code mappings: ensure integer keys are preserved
-                    code_map = metadata_entry.get('codes', {})
-                    formatted_mappings = []
-                    for k, v in code_map.items():
-                        # Convert numeric string keys to int for consistency
-                        try:
-                            key_int = int(k)
-                            formatted_mappings.append(f"'{key_int}' = '{v}'")
-                        except (ValueError, TypeError):
-                            # Keep non-numeric keys as strings
-                            formatted_mappings.append(f"'{k}' = '{v}'")
-                    
-                    if formatted_mappings:
-                        context_lines.append("  > Mappings: " + ", ".join(formatted_mappings))
-                else:
-                    # Simple string description
-                    context_lines.append(f"- {col}: {metadata_entry}")
-                
-                found = True
-                break
-        
-        # Handle aggregated or unrecognized columns
-        if not found and any(keyword in col_upper for keyword in ['COUNT', 'SUM', 'AVG', 'TOTAL', 'NUM']):
-            context_lines.append(f"- {col}: Calculated/aggregated value")
 
-    if context_lines:
-        return "\n\nColumn Meanings:\n" + "\n".join(context_lines)
-    
-    return ""
+        # Search only relevant tables first
+        for table in tables_used:
+            table_meta = COLUMN_METADATA.get(table, {})
+            col_meta = table_meta.get(col)
+
+            if col_meta:
+                found = True
+
+                desc = col_meta.get("description", f"Meaning of {col}")
+                context_lines.append(f"- {col}: {desc}")
+
+                codes = col_meta.get("codes", {})
+                if codes:
+                    mapping_lines = []
+                    for code, label in codes.items():
+                        mapping_lines.append(f"    {code} → {label}")
+                    context_lines.append("  Code Mappings:")
+                    context_lines.extend(mapping_lines)
+
+                break  # Stop searching tables once found
+
+        # If not found, check all remaining tables (just in case)
+        if not found:
+            for table in COLUMN_METADATA.keys():
+                if table in tables_used:
+                    continue  # already checked
+
+                col_meta = COLUMN_METADATA[table].get(col)
+                if col_meta:
+                    found = True
+                    desc = col_meta.get("description", f"Meaning of {col}")
+                    context_lines.append(f"- {col}: {desc}")
+
+                    codes = col_meta.get("codes", {})
+                    if codes:
+                        context_lines.append("  Code Mappings:")
+                        for code, label in codes.items():
+                            context_lines.append(f"    {code} → {label}")
+
+                    break
+
+        # If still not found, treat as aggregate
+        if not found:
+            if any(k in col for k in ["SUM", "COUNT", "AVG", "TOTAL"]):
+                context_lines.append(f"- {col}: Calculated/aggregated value")
+            else:
+                context_lines.append(f"- {col}: (No metadata available)")
+
+    return "\n".join(context_lines)
 
 
 # ---------------- LLM Explanation --------------------
