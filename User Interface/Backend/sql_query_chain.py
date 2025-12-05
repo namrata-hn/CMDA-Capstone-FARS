@@ -176,12 +176,6 @@ def get_column_metadata_context(df: pd.DataFrame, sql_query: str) -> str:
     """
     Build natural-language context for columns in the query result using
     the metadata loaded from fars_codebook.csv.
-
-    Uses COLUMN_METADATA structure:
-        COLUMN_METADATA[table][column] = {
-            "description": str,
-            "codes": { "1": "Clear", "2": "Rain", ... }
-        }
     """
     if not COLUMN_METADATA:
         return ""
@@ -189,68 +183,64 @@ def get_column_metadata_context(df: pd.DataFrame, sql_query: str) -> str:
     columns_in_result = [c.upper() for c in df.columns]
     query_lower = sql_query.lower()
 
-    # Determine which tables appear in the query
-    tables_used = []
-    if "accident_master" in query_lower:
-        tables_used.append("accident")
-    if "vehicle_master" in query_lower:
-        tables_used.append("vehicle")
-    if "person_master" in query_lower:
-        tables_used.append("person")
+    # Mapping Databricks Table Names -> FARS Codebook File Names
+    # The SQL might use "accident_master", but the codebook just uses "accident"
+    table_mapping = {
+        "accident_master": "accident",
+        "vehicle_master": "vehicle",
+        "person_master": "person",
+        "accidents": "accident", # Catch-alls
+        "vehicles": "vehicle",
+        "persons": "person",
+        "people": "person"
+    }
 
-    # Fallback: search all tables
-    if not tables_used:
-        tables_used = list(COLUMN_METADATA.keys())
+    # Identify which tables are likely in the SQL query
+    active_codebook_tables = []
+    for sql_key, codebook_key in table_mapping.items():
+        if sql_key in query_lower:
+            active_codebook_tables.append(codebook_key)
+
+    # If detection fails, default to checking all codebook tables
+    if not active_codebook_tables:
+        active_codebook_tables = list(COLUMN_METADATA.keys())
 
     context_lines = []
     context_lines.append("Column Meanings:")
 
     for col in columns_in_result:
-        found = False
-
-        # Search only relevant tables first
-        for table in tables_used:
-            table_meta = COLUMN_METADATA.get(table, {})
-            col_meta = table_meta.get(col)
-
-            if col_meta:
-                found = True
-
-                desc = col_meta.get("description", f"Meaning of {col}")
-                context_lines.append(f"- {col}: {desc}")
-
-                codes = col_meta.get("codes", {})
-                if codes:
-                    mapping_lines = []
-                    for code, label in codes.items():
-                        mapping_lines.append(f"    {code} → {label}")
-                    context_lines.append("  Code Mappings:")
-                    context_lines.extend(mapping_lines)
-
-                break  # Stop searching tables once found
-
-        # If not found, check all remaining tables (just in case)
-        if not found:
-            for table in COLUMN_METADATA.keys():
-                if table in tables_used:
-                    continue  # already checked
-
-                col_meta = COLUMN_METADATA[table].get(col)
-                if col_meta:
-                    found = True
-                    desc = col_meta.get("description", f"Meaning of {col}")
-                    context_lines.append(f"- {col}: {desc}")
-
-                    codes = col_meta.get("codes", {})
-                    if codes:
-                        context_lines.append("  Code Mappings:")
-                        for code, label in codes.items():
-                            context_lines.append(f"    {code} → {label}")
-
+        col_meta = None
+        
+        # 1. Search in the tables identified in the SQL query
+        for table_key in active_codebook_tables:
+            if table_key in COLUMN_METADATA:
+                if col in COLUMN_METADATA[table_key]:
+                    col_meta = COLUMN_METADATA[table_key][col]
+                    break
+        
+        # 2. Fallback: Search ALL tables if not found (e.g. JOINs might obscure table names)
+        if not col_meta:
+            for table_key in COLUMN_METADATA:
+                if col in COLUMN_METADATA[table_key]:
+                    col_meta = COLUMN_METADATA[table_key][col]
                     break
 
-        # If still not found, treat as aggregate
-        if not found:
+        # 3. Build the Context String
+        if col_meta:
+            desc = col_meta.get("description", f"Meaning of {col}")
+            context_lines.append(f"- {col}: {desc}")
+            
+            codes = col_meta.get("codes", {})
+            if codes:
+                context_lines.append("  Code Mappings:")
+                # Limit to first 30 codes to prevent context overflow if list is huge
+                for i, (code, label) in enumerate(codes.items()):
+                    if i > 30: 
+                        context_lines.append("    ... (more codes truncated)")
+                        break
+                    context_lines.append(f"    {code} -> {label}")
+        else:
+            # Handle aggregates or missing metadata
             if any(k in col for k in ["SUM", "COUNT", "AVG", "TOTAL"]):
                 context_lines.append(f"- {col}: Calculated/aggregated value")
             else:
