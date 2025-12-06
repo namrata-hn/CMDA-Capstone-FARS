@@ -1,0 +1,82 @@
+import pandas as pd
+from langchain_text_splitters import CharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+
+# ----------------- Config -----------------
+CODEBOOK_CSV_PATH = "../fars_codebook.csv"   
+FAISS_CODEBOOK_PATH = "../fars_codebook_faiss"
+
+# ----------------- Load CSV -----------------
+codebook_df = pd.read_csv(CODEBOOK_CSV_PATH)
+codebook_df.columns = [col.strip() for col in codebook_df.columns]  # remove whitespace
+
+# Fill missing columns if necessary
+for col in ['source', 'file', 'name_ncsa', 'label', 'Definition', 'Additional Information', 'value', 'value_label']:
+    if col not in codebook_df.columns:
+        codebook_df[col] = ''
+
+# ----------------- Combine all content -----------------
+def combine_row(row):
+    return (
+        f"Source: {row['source']}\n"
+        f"File: {row['file']}\n"
+        f"Variable: {row['name_ncsa']}\n"
+        f"Label: {row['label']}\n"
+        f"Definition: {row['Definition']}\n"
+        f"Additional Information: {row['Additional Information']}\n"
+        f"Value: {row['value']}\n"
+        f"Value Label: {row['value_label']}"
+    )
+
+codebook_df['combined_text'] = codebook_df.apply(combine_row, axis=1)
+
+# ----------------- Chunk texts -----------------
+text_splitter = CharacterTextSplitter(
+    separator="\n",
+    chunk_size=800,    # handles long entries
+    chunk_overlap=100
+)
+
+texts = []
+metadatas = []
+
+for _, row in codebook_df.iterrows():
+    chunks = text_splitter.split_text(row['combined_text'])
+    texts.extend(chunks)
+    for _ in chunks:
+        metadatas.append({
+            "source": row['source'],
+            "file": row['file'],
+            "variable": row['name_ncsa'],
+            "label": row['label'],
+            "value": row['value'],
+            "value_label": row['value_label']
+        })
+
+# ----------------- Create embeddings -----------------
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# ----------------- Build FAISS vectorstore -----------------
+codebook_vectorstore = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
+
+# ----------------- Save FAISS index -----------------
+codebook_vectorstore.save_local(FAISS_CODEBOOK_PATH)
+print(f"Codebook FAISS index saved to: {FAISS_CODEBOOK_PATH}")
+
+# ----------------- Load retriever -----------------
+loaded_codebook_vs = FAISS.load_local(
+    FAISS_CODEBOOK_PATH, embeddings=embeddings, allow_dangerous_deserialization=True
+)
+codebook_retriever = loaded_codebook_vs.as_retriever(search_kwargs={"k": 4})
+
+# ----------------- Example query -----------------
+query = "What does WEATHER = 3 mean?"
+
+# Call _get_relevant_documents with run_manager=None
+results: list[Document] = codebook_retriever._get_relevant_documents(query, run_manager=None)
+
+for doc in results:
+    print(doc.page_content)
+    print(doc.metadata)

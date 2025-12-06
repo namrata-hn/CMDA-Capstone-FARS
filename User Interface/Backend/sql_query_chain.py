@@ -206,6 +206,24 @@ def qualify_table_names(sql_query: str) -> str:
         sql_query = re.sub(pattern, fq_name, sql_query)
     return sql_query
 
+# ---------------------- Ambiguous Column Qualifier ---------------------
+AMBIGUOUS_COLUMNS = {
+    "STATE": "workspace.fars_database.accident_master",
+    "ST_CASE": "workspace.fars_database.accident_master",
+    "YEAR": "workspace.fars_database.accident_master"
+}
+
+def qualify_ambiguous_columns(sql_query: str) -> str:
+    """
+    Prepend fully-qualified table names to ambiguous columns only.
+    Example: STATE -> accident_master.STATE
+    """
+    for col, table in AMBIGUOUS_COLUMNS.items():
+        # Only replace standalone column names (not already qualified)
+        pattern = rf"(?<!\.)\b{col}\b"
+        sql_query = re.sub(pattern, f"{table}.{col}", sql_query)
+    return sql_query
+
 def get_column_metadata_context(df: pd.DataFrame, sql_query: str) -> str:
     """
     Build natural-language context for columns in the query result using
@@ -441,6 +459,10 @@ def ask_fars_database(question: str, max_retries: int = 0):
         logger.info(f"Generating SQL for question: {question}")
         response = llm.invoke(full_prompt)
         sql_query = clean_sql_output(response.content.strip())
+        
+        # 1) Qualify ambiguous columns to avoid SQL ambiguity
+        sql_query = qualify_ambiguous_columns(sql_query)
+        # 2) Fully qualify table names for any remaining unqualified tables
         sql_query = qualify_table_names(sql_query)
         
         logger.info(f"Generated SQL: {sql_query}")

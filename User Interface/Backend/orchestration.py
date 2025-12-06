@@ -22,7 +22,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # ----------------------------------------------
-# 2) LOAD PREBUILT FAISS INDEX (accident table only)
+# 2) LOAD ACCIDENT FAISS INDEX
 # ----------------------------------------------
 
 FAISS_PATH = "../../accident_master_faiss"
@@ -40,15 +40,36 @@ vectorstore = FAISS.load_local(
 accident_retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
 # ----------------------------------------------
-# 3) SIMPLE RAG QA
+# 2a) LOAD FARS CODEBOOK FAISS INDEX
+# ----------------------------------------------
+CODEBOOK_FAISS_PATH = "../../fars_codebook_faiss"
+
+print(f"Loading Codebook FAISS vectorstore from: {CODEBOOK_FAISS_PATH}")
+
+codebook_vectorstore = FAISS.load_local(
+    CODEBOOK_FAISS_PATH,
+    embeddings=embeddings,
+    allow_dangerous_deserialization=True
+)
+
+codebook_retriever = codebook_vectorstore.as_retriever(search_kwargs={"k": 4})
+
+# ----------------------------------------------
+# 3) SIMPLE RAG QA (supporting both retrievers)
 # ----------------------------------------------
 class SimpleRAGQA:
-    def __init__(self, retriever, llm):
-        self.retriever = retriever
+    def __init__(self, accident_retriever, codebook_retriever, llm):
+        self.accident_retriever = accident_retriever
+        self.codebook_retriever = codebook_retriever
         self.llm = llm
 
     def answer(self, query: str):
-        source_docs = self.retriever.invoke(query)
+        # Query both FAISS indexes
+        accident_docs = self.accident_retriever.invoke(query)
+        codebook_docs = self.codebook_retriever.invoke(query)
+
+        # Combine results
+        source_docs = accident_docs + codebook_docs
 
         context = "\n\n".join(doc.page_content for doc in source_docs)
 
@@ -70,7 +91,7 @@ Answer in clear, concise English:
         return getattr(response, "content", str(response)).strip()
 
 rag_llm = ChatOllama(model="llama3", temperature=0.0)
-rag_qa = SimpleRAGQA(accident_retriever, rag_llm)
+rag_qa = SimpleRAGQA(accident_retriever, codebook_retriever, rag_llm)
 
 def run_rag(question: str) -> str:
     return rag_qa.answer(question)
@@ -86,7 +107,6 @@ You are a routing classifier for a hybrid SQL + RAG system for the FARS dataset.
 Your job:
 - Route questions about the FARS tables, their columns, meaning, definitions, or descriptive explanations → "rag"
 - Route questions asking for counts, sums, averages, filters, comparisons on the FARS data → "sql"
-- Route questions asking BOTH numeric results AND explanation → "both"
 
 IMPORTANT EXCEPTIONS:
 - If the question is general knowledge (e.g., geography, history, definitions NOT related to FARS),
@@ -94,7 +114,7 @@ IMPORTANT EXCEPTIONS:
 - If the question is not about the dataset at all, return "rag".
 
 Return ONLY one of these EXACT labels:
-"sql", "rag", "both"
+"sql", "rag"
 
 QUESTION:
 {question}
@@ -102,12 +122,11 @@ QUESTION:
 LABEL ONLY:
 """
 
-
-def route(question: str) -> Literal["sql", "rag", "both"]:
+def route(question: str) -> Literal["sql", "rag"]:
     prompt = ROUTER_PROMPT.format(question=question)
     response = router_llm.invoke(prompt)
     label = getattr(response, "content", "").strip().lower()
-    return label if label in {"sql", "rag", "both"} else "sql"
+    return label if label in {"sql", "rag"} else "rag"
 
 # ----------------------------------------------
 # 5) ORCHESTRATION LAYER
@@ -117,15 +136,8 @@ def answer_question(question: str):
 
     if choice == "sql":
         return ask_fars_database(question)
-
-    elif choice == "rag":
+    else:  # rag
         return run_rag(question)
-
-    else:  # both
-        return (
-            f"SQL Result:\n{ask_fars_database(question)}\n\n"
-            f"Explanation:\n{run_rag(question)}"
-        )
 
 # ----------------------------------------------
 # 6) CLI
